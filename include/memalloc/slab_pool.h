@@ -49,7 +49,9 @@ public:
     }
 
 private:
-    void grow();
+    // Maps a new slab and adds it to the pool. Returns false if the mmap
+    // failed (out of memory).
+    bool grow();
 
     std::mutex mutex_;
     SlabRegistry& registry_;

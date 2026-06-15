@@ -21,8 +21,10 @@ SlabPool::~SlabPool() {
     }
 }
 
-void SlabPool::grow() {
+bool SlabPool::grow() {
     void* mem = mmap_aligned(kSlabSize, kSlabSize);
+    if (!mem) return false;
+
     auto* slab = static_cast<SlabHeader*>(mem);
 
     slab->slot_size = static_cast<std::uint32_t>(slot_size_);
@@ -46,11 +48,12 @@ void SlabPool::grow() {
     all_ = slab;
 
     registry_.insert(base);
+    return true;
 }
 
 void* SlabPool::allocate() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!partial_) grow();
+    if (!partial_ && !grow()) return nullptr;
 
     SlabHeader* slab = partial_;
     void* p = slab->free_list;

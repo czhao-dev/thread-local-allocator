@@ -1,5 +1,8 @@
 #include "slab_registry.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "mmap_utils.h"
 
 namespace memalloc {
@@ -25,6 +28,10 @@ void SlabRegistry::grow() {
     std::size_t new_capacity = capacity_ == 0 ? kInitialCapacity : capacity_ * 2;
     auto* new_table = static_cast<std::uintptr_t*>(
         mmap_region(new_capacity * sizeof(std::uintptr_t)));
+    if (!new_table) {
+        std::fprintf(stderr, "memalloc: failed to grow slab registry (out of memory)\n");
+        std::abort();
+    }
 
     if (table_) {
         for (std::size_t i = 0; i < capacity_; ++i) {

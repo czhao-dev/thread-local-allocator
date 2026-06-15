@@ -95,7 +95,19 @@ FreeListAllocator::Header* FreeListAllocator::split(Header* h, std::size_t alloc
     if (old_size - alloc_total_size >= kMinBlockSize) {
         set_tags(h, alloc_total_size, /*free=*/false);
         Header* rem = next_block(h);
-        set_tags(rem, old_size - alloc_total_size, /*free=*/true);
+        std::size_t rem_size = old_size - alloc_total_size;
+        set_tags(rem, rem_size, /*free=*/true);
+
+        // `rem` may already be adjacent to a free block (split() is also
+        // called from reallocate(), where h's neighbors were never
+        // re-examined) -- coalesce forward to preserve the "no two
+        // adjacent free blocks" invariant.
+        Header* next = next_block(rem);
+        if (is_free(next)) {
+            remove_free(next);
+            rem_size += size_of(next);
+            set_tags(rem, rem_size, /*free=*/true);
+        }
         insert_free(rem);
     } else {
         set_tags(h, old_size, /*free=*/false);
