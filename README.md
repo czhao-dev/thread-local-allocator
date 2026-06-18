@@ -38,19 +38,21 @@ native applications.
 ## Architecture
 
 ```
-                    ┌─────────────────────────────┐
-  allocate(size) ──►│       Allocator Facade        │
-                    └──────────┬──────────┬─────────┘
-                               │          │
-               size ≤ 512B     │          │  size > 512B
-                               ▼          ▼
-                    ┌──────────────┐  ┌───────────────────┐
-                    │ Slab Pools   │  │ Free List (coalesce│
-                    │ [8, 16, 32,  │  │ + boundary tags)   │
-                    │  64, 128,    │  │                    │
-                    │  256, 512]   │  │  mmap-backed       │
-                    └──────────────┘  └───────────────────┘
-                    mmap-backed slabs   variable-size spans
+                                allocate(size)
+                                       │
+                          ┌────────────────────────┐
+                          │    Allocator Facade    │
+                          └────────────────────────┘
+                                       │
+             size ≤ 512B                            size > 512B
+                   ┌───────────────────┴─────────────────┐
+                   ▼                                     ▼
+       ┌──────────────────────┐            ┌──────────────────────────┐
+       │      Slab Pools      │            │        Free List         │
+       │       8..512B        │            │     boundary tags +      │
+       │     fixed slots      │            │        coalescing        │
+       └──────────────────────┘            └──────────────────────────┘
+          mmap-backed slabs                     mmap-backed arenas
 ```
 
 The facade dispatches on request size. Small, fixed-size requests go to the
@@ -191,6 +193,62 @@ of higher complexity and increased per-thread memory footprint.
 
 ---
 
+## Testing & Verification
+
+The test suite ([`tests/`](tests/)) exercises the allocator from the outside —
+through the same `allocate`/`deallocate`/`reallocate` facade a real program
+would use — rather than poking at internal state, so passing tests mean the
+public contract actually holds.
+
+| Test | What it verifies |
+|------|-------------------|
+| `test_alignment` | Every allocation, across all 7 slab size classes and the free-list path, is aligned to its size class (16 bytes for free-list allocations), and `usable_size()` never reports less than what was requested. |
+| `test_values` | Allocated memory holds exactly the bytes written to it, for both slab and free-list size classes, and `reallocate()` preserves existing contents across a grow. |
+| `test_coalesce` | Freeing adjacent blocks produces correctly merged block sizes via immediate boundary-tag coalescing — including the three-way backward-and-forward merge case — and a subsequent allocation can reuse the fully coalesced region without growing the heap. |
+| `test_double_free` | Freeing the same free-list pointer twice is detected and the process aborts (`SIGABRT`) rather than silently corrupting the heap. Run in a forked child so the crash doesn't take down the test runner. |
+| `test_concurrent` | 8 threads × 20,000 allocate/free operations on random sizes (1–4096 bytes) spanning both the slab pools and the free list, writing and verifying a per-allocation byte pattern to catch any corruption from races. |
+
+```
+$ ctest --test-dir build --output-on-failure
+    Start 1: test_alignment
+1/5 Test #1: test_alignment ...................   Passed    0.01 sec
+    Start 2: test_values
+2/5 Test #2: test_values ......................   Passed    0.00 sec
+    Start 3: test_coalesce
+3/5 Test #3: test_coalesce ....................   Passed    0.00 sec
+    Start 4: test_concurrent
+4/5 Test #4: test_concurrent ..................   Passed    0.12 sec
+    Start 5: test_double_free
+5/5 Test #5: test_double_free .................   Passed    0.02 sec
+
+100% tests passed, 0 tests failed out of 5
+```
+
+All five also pass cleanly rebuilt with `-DMEMALLOC_ENABLE_ASAN=ON`
+(AddressSanitizer + UndefinedBehaviorSanitizer), including the 160,000-operation
+concurrent stress test — no use-after-free, heap-buffer-overflow, data race, or
+undefined-behavior reports.
+
+```bash
+cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DMEMALLOC_ENABLE_ASAN=ON
+cmake --build build-asan
+ctest --test-dir build-asan --output-on-failure
+```
+
+This sanitizer build earned its keep during development: it surfaced a real
+bug where `reallocate()`'s shrink/grow paths reused the same block-splitting
+routine as `allocate()`, but without re-checking whether the leftover
+remainder was now adjacent to an already-free block. The result was a quiet
+violation of the free list's "no two adjacent free blocks" invariant — not
+memory corruption, but unnecessary fragmentation and avoidable arena growth
+under repeated realloc cycles. A targeted stress test reproduced it directly
+(`free_block_count()` went from 2 to 3 across a single shrinking `reallocate`
+where it should have stayed at 2), and the fix — coalescing the remainder
+forward in `split()` before inserting it into the free list — brought it back
+to 2.
+
+---
+
 ## Benchmarks
 
 Measured on Apple Silicon (ARM64) macOS, Apple Clang 21, `-O2`
@@ -319,10 +377,8 @@ DYLD_INSERT_LIBRARIES=./build/lib/libmemalloc.dylib DYLD_FORCE_FLAT_NAMESPACE=1 
 ctest --test-dir build --output-on-failure
 ```
 
-Tests verify: correct byte values after allocation, no double-free crashes,
-coalescing produces correct merged block sizes, alignment guarantees hold for
-all size classes, concurrent stress test produces no corruption (validated with
-AddressSanitizer).
+See *Testing & Verification* above for what each test covers and how to run
+the AddressSanitizer/UndefinedBehaviorSanitizer build.
 
 ---
 
@@ -351,3 +407,9 @@ AddressSanitizer).
 - jemalloc design documentation — https://jemalloc.net/jemalloc.3.html
 - *CS:APP, 3rd Edition*, Bryant & O'Hallaron — Chapter 9 (dynamic memory
   allocation), the clearest textbook treatment of boundary tags
+
+---
+
+## License
+
+[MIT](LICENSE)
