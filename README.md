@@ -1,5 +1,8 @@
 # memalloc — Custom Memory Allocator in C++
 
+[![Language](https://img.shields.io/badge/language-C%2B%2B17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 A from-scratch memory allocator implementing two complementary strategies: a
 **slab allocator** for fixed-size objects and a **boundary-tag free list** with
 immediate coalescing for variable-size allocations. Benchmarked against the
