@@ -41,7 +41,21 @@ public:
     void* allocate();
     void deallocate(void* p);
 
+    // Batch variants used by ThreadCache to amortize lock acquisition.
+    // allocate_batch pops up to `n` slots under a single lock, threads them
+    // via their embedded next-pointer field, and returns the list head (or
+    // nullptr if OOM even after grow()). *out_count is set to the actual
+    // number obtained.
+    void* allocate_batch(std::uint32_t n, std::uint32_t* out_count);
+
+    // deallocate_batch pushes all `count` slots in `list_head` (linked via
+    // embedded next-pointer field) back to their owning slabs under one lock.
+    void deallocate_batch(void* list_head, std::uint32_t count);
+
     std::size_t slot_size() const { return slot_size_; }
+
+    // Returns the number of slabs currently mapped by this pool. Test helper.
+    std::size_t mapped_slab_count() const;
 
     static SlabHeader* header_for(void* p) {
         auto addr = reinterpret_cast<std::uintptr_t>(p);
@@ -53,7 +67,7 @@ private:
     // failed (out of memory).
     bool grow();
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     SlabRegistry& registry_;
     SlabHeader* partial_ = nullptr;  // slabs with at least one free slot
     SlabHeader* all_ = nullptr;      // every slab ever mapped, for teardown

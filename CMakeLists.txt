@@ -29,6 +29,7 @@ add_library(memalloc_core STATIC
     src/mmap_utils.cpp
     src/slab_registry.cpp
     src/slab_pool.cpp
+    src/thread_cache.cpp
     src/free_list.cpp
     src/allocator.cpp
 )

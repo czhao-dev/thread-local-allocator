@@ -82,4 +82,52 @@ void SlabPool::deallocate(void* p) {
     }
 }
 
+void* SlabPool::allocate_batch(std::uint32_t n, std::uint32_t* out_count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    void*         list_head = nullptr;
+    std::uint32_t count     = 0;
+    while (count < n) {
+        if (!partial_ && !grow()) break;
+        SlabHeader* slab = partial_;
+        void* p          = slab->free_list;
+        slab->free_list  = *static_cast<void**>(p);
+        --slab->free_count;
+        if (slab->free_count == 0) {
+            partial_           = slab->next_partial;
+            slab->next_partial = nullptr;
+        }
+        *static_cast<void**>(p) = list_head;
+        list_head = p;
+        ++count;
+    }
+    *out_count = count;
+    return list_head;
+}
+
+void SlabPool::deallocate_batch(void* list_head, std::uint32_t count) {
+    if (!list_head) return;
+    (void)count;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (void* p = list_head; p;) {
+        void*       next = *static_cast<void**>(p);
+        SlabHeader* slab = header_for(p);
+        bool was_full    = (slab->free_count == 0);
+        *static_cast<void**>(p) = slab->free_list;
+        slab->free_list = p;
+        ++slab->free_count;
+        if (was_full) {
+            slab->next_partial = partial_;
+            partial_           = slab;
+        }
+        p = next;
+    }
+}
+
+std::size_t SlabPool::mapped_slab_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::size_t n = 0;
+    for (SlabHeader* s = all_; s; s = s->next_all) ++n;
+    return n;
+}
+
 }  // namespace memalloc

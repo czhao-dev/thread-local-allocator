@@ -3,6 +3,7 @@ foreach(test_name IN ITEMS
     test_values
     test_coalesce
     test_concurrent
+    test_thread_cache
 )
     add_executable(${test_name} ${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE memalloc_core)

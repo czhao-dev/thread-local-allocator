@@ -6,6 +6,7 @@
 #include "memalloc/common.h"
 #include "memalloc/free_list.h"
 #include "memalloc/slab_pool.h"
+#include "memalloc/thread_cache.h"
 #include "slab_registry.h"
 
 namespace memalloc {
@@ -19,25 +20,28 @@ inline std::size_t pool_index(std::size_t size_class) {
 }
 
 // Top-level facade: dispatches allocate/deallocate/reallocate between the
-// slab pools (small, fixed-size requests) and the boundary-tag free list
-// (everything above kSlabThreshold). See README "Architecture".
+// per-thread cache -> slab pools (small, fixed-size requests) and the
+// boundary-tag free list (everything above kSlabThreshold). See README.
 class Allocator {
 public:
     static Allocator& instance() {
-        static Allocator inst;
+        // Leaked intentionally: avoids a destruction-order race between this
+        // singleton's static destructor and any thread_local ThreadCache
+        // destructors still flushing on the main thread at program exit.
+        static Allocator& inst = *new Allocator();
         return inst;
     }
 
     void* allocate(std::size_t size) {
         std::size_t cls = slab_class_for(size);
-        if (cls != 0) return pools_[pool_index(cls)].allocate();
+        if (cls != 0) return thread_cache_for(pools_).allocate(pool_index(cls));
         return free_list_.allocate(size);
     }
 
     void deallocate(void* p) {
         if (!p) return;
         if (SlabPool::SlabHeader* slab = slab_owner(p)) {
-            pools_[pool_index(slab->slot_size)].deallocate(p);
+            thread_cache_for(pools_).deallocate(pool_index(slab->slot_size), p);
         } else {
             free_list_.deallocate(p);
         }
@@ -56,7 +60,7 @@ public:
             void* np = allocate(new_size);
             if (!np) return nullptr;
             std::memcpy(np, p, old_size);
-            pools_[pool_index(old_size)].deallocate(p);
+            thread_cache_for(pools_).deallocate(pool_index(old_size), p);
             return np;
         }
         return free_list_.reallocate(p, new_size);
@@ -86,9 +90,9 @@ private:
         return reinterpret_cast<SlabPool::SlabHeader*>(base);
     }
 
-    SlabRegistry registry_;
-    SlabPool pools_[kNumSlabSizeClasses];
-    FreeListAllocator free_list_;
+    SlabRegistry       registry_;
+    SlabPool           pools_[kNumSlabSizeClasses];
+    FreeListAllocator  free_list_;
 };
 
 }  // namespace

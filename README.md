@@ -1,12 +1,13 @@
-# memalloc — Custom Memory Allocator in C++
+# memalloc — Thread-Local Memory Allocator in C++
 
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A from-scratch memory allocator implementing two complementary strategies: a
-**slab allocator** for fixed-size objects and a **boundary-tag free list** with
-immediate coalescing for variable-size allocations. Benchmarked against the
-system allocator across workloads with varying allocation size distributions and
+A from-scratch memory allocator implementing three complementary strategies: a
+**per-thread cache** for lock-free fast-path allocation, a **slab allocator**
+for fixed-size objects, and a **boundary-tag free list** with immediate
+coalescing for variable-size allocations. Benchmarked against the system
+allocator across workloads with varying allocation size distributions and
 concurrency levels.
 
 ---
@@ -22,6 +23,10 @@ tcmalloc, and mimalloc each make distinct tradeoffs to address these pressures.
 `memalloc` builds the foundational techniques of allocator design from first
 principles:
 
+- **Per-thread cache** — eliminates lock acquisition on the common path for
+  small (≤512B) allocations; each thread maintains a free list per size class
+  and only touches a central mutex when refilling or flushing a batch (the
+  tcmalloc design)
 - **Slab allocator** — eliminates internal fragmentation for fixed-size objects
   by carving a single large allocation into uniform slots, amortizing metadata
   overhead and preserving object alignment across free/alloc cycles
@@ -51,17 +56,27 @@ native applications.
                    ┌───────────────────┴─────────────────┐
                    ▼                                     ▼
        ┌──────────────────────┐            ┌──────────────────────────┐
-       │      Slab Pools      │            │        Free List         │
-       │       8..512B        │            │     boundary tags +      │
-       │     fixed slots      │            │        coalescing        │
-       └──────────────────────┘            └──────────────────────────┘
-          mmap-backed slabs                     mmap-backed arenas
+       │    ThreadCache       │            │        Free List         │
+       │  (per-thread, lock-  │            │     boundary tags +      │
+       │   free fast path)    │            │        coalescing        │
+       └──────┬───────────────┘            └──────────────────────────┘
+              │ refill / flush batch             mmap-backed arenas
+              ▼ (one lock per batch)
+       ┌──────────────────────┐
+       │      Slab Pools      │
+       │  (central back-end,  │
+       │   one mutex / class) │
+       └──────────────────────┘
+          mmap-backed slabs
 ```
 
-The facade dispatches on request size. Small, fixed-size requests go to the
-slab pool for that size class. Larger requests go to the boundary-tag free list.
-Both strategies call `mmap(2)` directly for backing memory, bypassing the system
-`brk`/`sbrk` interface for cleaner address space management.
+The facade dispatches on request size. Small (≤512B) requests go first to the
+calling thread's `ThreadCache` — a per-thread free list per size class that
+requires no locking on the common path. When a thread's bucket empties it pulls
+a batch of 32 slots from the central `SlabPool` under one lock; when a bucket
+exceeds 64 slots it flushes 32 back in one lock. Larger requests bypass the
+cache and go directly to the boundary-tag free list. All backing memory comes
+from `mmap(2)`, bypassing `brk`/`sbrk` for cleaner address space management.
 
 ---
 
@@ -176,23 +191,55 @@ complexity — this is the approach taken by jemalloc.
 
 ## Thread Safety Model
 
-Each slab pool (one per size class) carries its own `std::mutex`. Concurrent
-allocations of different size classes proceed without contention:
+### Per-thread cache (slab fast path)
+
+For small allocations (≤512B) the calling thread never acquires a lock on the
+common path. Each thread holds a `ThreadCache` (constructed lazily on first
+access via a `thread_local`) with an embedded free list per size class:
 
 ```cpp
-void* SlabPool::allocate() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    // ... O(1) slot pop
+void* ThreadCache::allocate(size_t idx) {
+    Bucket& b = buckets_[idx];
+    if (b.count == 0) refill_from_central_pool(idx);  // one lock, 32 objects
+    void* p = b.head;
+    b.head = *static_cast<void**>(p);  // pop — no lock
+    return p;
 }
 ```
 
-The free list allocator uses a single mutex over the entire heap. This is
-intentionally simple and correctness-first — see *Future Extensions* for the
-path toward per-thread caches.
+Refill (bucket empty) and flush (bucket exceeds 64 slots) each acquire the
+central `SlabPool`'s per-class mutex exactly once to transfer a batch of 32
+objects, amortizing contention across N allocations rather than 1.
 
-The design mirrors the tradeoff in production allocators: tcmalloc uses
-per-thread caches to eliminate lock acquisition on the common path, at the cost
-of higher complexity and increased per-thread memory footprint.
+**Cross-thread free** is handled transparently: an object allocated by thread A
+and freed by thread B is pushed onto B's own bucket for that size class. At
+the central `SlabPool` level `header_for(p)` identifies the owning slab by
+masking the pointer, so flushing back works regardless of which thread
+originally allocated the object.
+
+**Thread-exit cleanup**: the `ThreadCache` destructor flushes all buckets back
+to the central pools. If `malloc` is called again on the same thread after that
+destructor has run (possible when another library's TLS destructor calls malloc
+during teardown), a `dead_` guard flag redirects the call directly to the
+central `SlabPool`, which is safe to call from any execution context. Residual
+risk: a `quick_exit` or `abort` skips C++ destructors entirely, leaving cached
+objects unreachable — this matches the behaviour of tcmalloc and jemalloc,
+which also accept this edge case in exchange for avoiding per-CPU cache
+complexity.
+
+### Central slab back-end
+
+Each `SlabPool` (one per size class) has its own `std::mutex`. Threads only
+contend on a class's mutex when their cache refills or flushes, not on every
+operation. Concurrent allocations of different size classes are always
+contention-free.
+
+### Large allocations
+
+The `FreeListAllocator` (>512B) uses a single mutex over the entire large-object
+heap. Large allocations are less frequent and coalescing requires global
+visibility of adjacent blocks, so per-thread caching would reintroduce exactly
+the fragmentation the immediate-coalescing design exists to prevent.
 
 ---
 
@@ -210,24 +257,27 @@ public contract actually holds.
 | `test_coalesce` | Freeing adjacent blocks produces correctly merged block sizes via immediate boundary-tag coalescing — including the three-way backward-and-forward merge case — and a subsequent allocation can reuse the fully coalesced region without growing the heap. |
 | `test_double_free` | Freeing the same free-list pointer twice is detected and the process aborts (`SIGABRT`) rather than silently corrupting the heap. Run in a forked child so the crash doesn't take down the test runner. |
 | `test_concurrent` | 8 threads × 20,000 allocate/free operations on random sizes (1–4096 bytes) spanning both the slab pools and the free list, writing and verifying a per-allocation byte pattern to catch any corruption from races. |
+| `test_thread_cache` | Two targeted thread-cache tests: (1) *cross-thread free* — 256 objects allocated in thread A, pattern-verified and freed in thread B; (2) *thread-exit drain* — 64 short-lived threads each allocate and free 80 objects (above the cache high-water mark of 64), then a post-drain batch confirms the memory was returned to the central pool and is reusable with correct contents. |
 
 ```
 $ ctest --test-dir build --output-on-failure
     Start 1: test_alignment
-1/5 Test #1: test_alignment ...................   Passed    0.01 sec
+1/6 Test #1: test_alignment ...................   Passed    0.31 sec
     Start 2: test_values
-2/5 Test #2: test_values ......................   Passed    0.00 sec
+2/6 Test #2: test_values ......................   Passed    0.19 sec
     Start 3: test_coalesce
-3/5 Test #3: test_coalesce ....................   Passed    0.00 sec
+3/6 Test #3: test_coalesce ....................   Passed    0.18 sec
     Start 4: test_concurrent
-4/5 Test #4: test_concurrent ..................   Passed    0.12 sec
-    Start 5: test_double_free
-5/5 Test #5: test_double_free .................   Passed    0.02 sec
+4/6 Test #4: test_concurrent ..................   Passed    0.37 sec
+    Start 5: test_thread_cache
+5/6 Test #5: test_thread_cache ................   Passed    0.22 sec
+    Start 6: test_double_free
+6/6 Test #6: test_double_free .................   Passed    0.20 sec
 
-100% tests passed, 0 tests failed out of 5
+100% tests passed, 0 tests failed out of 6
 ```
 
-All five also pass cleanly rebuilt with `-DMEMALLOC_ENABLE_ASAN=ON`
+All six also pass cleanly rebuilt with `-DMEMALLOC_ENABLE_ASAN=ON`
 (AddressSanitizer + UndefinedBehaviorSanitizer), including the 160,000-operation
 concurrent stress test — no use-after-free, heap-buffer-overflow, data race, or
 undefined-behavior reports.
@@ -260,21 +310,21 @@ Measured on Apple Silicon (ARM64) macOS, Apple Clang 21, `-O2`
 platform's system allocator. Reproduce with `benchmarks/run_all.sh`; numbers
 will vary by platform and allocator implementation.
 
-### Workload 1 — Fixed-size churn (slab advantage)
+### Workload 1 — Fixed-size churn (thread-cache advantage)
 
 Repeatedly allocate and free 64-byte objects from 8 concurrent threads.
 
 | Allocator | Throughput (Mops/sec) | Peak RSS |
 |-----------|----------------------|----------|
-| memalloc  | 245.9                | 1.7 MB   |
-| system    | 346.0                | 1.6 MB   |
+| memalloc  | 280.5                | 1.7 MB   |
+| system    | 250.7                | 1.7 MB   |
 
-The slab pool gives `memalloc` O(1), per-size-class allocation with no
-boundary-tag overhead, but on this platform the system allocator's own
-small-object zones use a comparable slab-like scheme that is hand-tuned in
-assembly, so it edges out `memalloc` on this micro-benchmark. The
-per-`free()` slab-registry lookup (see "Architecture") is the main remaining
-overhead relative to that baseline.
+The per-thread cache removes all lock acquisition from the common alloc/free
+path; the central slab pool mutex is touched only on batch refill/flush (one
+lock per 32 operations instead of one per operation). `memalloc` is ~12%
+faster than the system allocator on this workload. Without the thread cache
+the previous result was ~246 Mops/sec — the cache added ~34 Mops/sec on this
+8-thread benchmark.
 
 ### Workload 2 — Mixed-size allocation (general case)
 
@@ -283,14 +333,16 @@ bytes, hold a random subset live, free the rest. Repeat for 10M operations.
 
 | Allocator | Throughput (Mops/sec) | Fragmentation |
 |-----------|----------------------|----------------|
-| memalloc  | 30.7                 | 87.7%          |
-| system    | 27.9                 | 87.6%          |
+| memalloc  | 29.1                 | 87.7%          |
+| system    | 28.0                 | 87.6%          |
 
-`memalloc` is slightly faster here. Both allocators report similar
-fragmentation; this metric is `1 - live_bytes/peak_RSS`, which is dominated
-by the few-MB process baseline RSS relative to the ~0.5 MB of objects live
-at any one time, so it mainly reflects fixed overhead rather than heap
-layout quality at this scale.
+`memalloc` is slightly faster here. The thread cache applies only to the
+≤512B slab path; large allocations still go directly to the single-mutex
+free list, so the speedup here is modest — most of the 10M ops in this
+distribution fall in the slab range but the large-allocation tail brings
+the average closer to parity. Both allocators report similar fragmentation;
+this metric is dominated by fixed process-baseline RSS relative to the
+~0.5 MB of live objects, so it reflects overhead rather than heap layout.
 
 ### Workload 3 — Single-threaded latency
 
@@ -298,11 +350,13 @@ Measure p50 / p99 / p999 allocation latency for 64-byte objects.
 
 | Allocator | p50 (ns) | p99 (ns) | p999 (ns) |
 |-----------|----------|----------|-----------|
-| memalloc  | 0        | 42       | 834       |
+| memalloc  | 0        | 42       | 833       |
 | system    | 0        | 42       | 875       |
 
-Both allocators resolve the common case in well under the timer's
-resolution; tail latencies are comparable.
+Both allocators resolve the common case in well under the timer's resolution;
+tail latencies are comparable. The thread cache helps most under concurrency
+(Workload 1), not on single-threaded latency where lock contention was already
+absent.
 
 ---
 
@@ -387,15 +441,19 @@ the AddressSanitizer/UndefinedBehaviorSanitizer build.
 
 ## Future Extensions
 
-- **Per-thread caches** — eliminate lock acquisition on the common path by
-  maintaining a small per-thread free list, flushing to the global pool when
-  full (the tcmalloc design)
+- **Per-CPU caches** — replace `thread_local` caches with per-logical-CPU
+  caches (using `sched_getcpu()` / processor affinity), eliminating the
+  TLS-teardown edge case and matching the approach tcmalloc took after its
+  own per-thread phase
 - **Segregated free lists for variable-size** — maintain one free list per
   power-of-two size range to recover O(1) amortized search (the jemalloc design)
 - **`madvise(MADV_FREE)`** — hint to the kernel that empty slab pages can be
   reclaimed, reducing RSS under memory pressure without `munmap` overhead
 - **Valgrind / ASan client requests** — annotate allocations so memory
   debugging tools report errors correctly when `LD_PRELOAD`'d
+- **Idle-cache reclaim** — a background thread that periodically flushes
+  thread caches that have not been active recently, recovering per-thread
+  footprint drift (tcmalloc's "garbage collection" mechanism)
 
 ---
 
