@@ -43,6 +43,42 @@ native applications.
 
 ---
 
+## Repository Layout
+
+```text
+.
+├── CMakeLists.txt               # top-level: C++17, options, MEMALLOC_ENABLE_ASAN
+├── include/memalloc/            # public headers (the allocator API)
+│   ├── allocator.h              # top-level Allocator facade
+│   ├── common.h                 # shared constants/helpers
+│   ├── thread_cache.h           # per-thread cache (lock-free fast path)
+│   ├── slab_pool.h              # central slab back-end (one mutex/class)
+│   └── free_list.h              # boundary-tag free list (>512B allocations)
+├── src/                         # implementation
+│   ├── allocator.cpp            # facade dispatch
+│   ├── thread_cache.cpp         # ThreadCache impl
+│   ├── slab_pool.cpp            # SlabPool impl
+│   ├── slab_registry.h / .cpp   # pointer -> owning slab lookup
+│   ├── free_list.cpp            # boundary tags + coalescing
+│   ├── mmap_utils.h / .cpp      # mmap/munmap wrappers
+│   └── malloc_shim.cpp          # LD_PRELOAD / DYLD_INSERT_LIBRARIES entry points
+├── tests/                       # CTest binaries, one per file
+│   ├── test_alignment.cpp
+│   ├── test_values.cpp
+│   ├── test_coalesce.cpp
+│   ├── test_double_free.cpp     # forked-child SIGABRT check
+│   ├── test_concurrent.cpp      # 8 threads x 20,000 ops stress test
+│   └── test_thread_cache.cpp    # cross-thread free + thread-exit drain
+└── benchmarks/                  # throughput/latency vs. system allocator
+    ├── fixed_size_bench.cpp
+    ├── mixed_size_bench.cpp
+    ├── latency_bench.cpp
+    ├── run_all.sh               # drives all three + the system allocator
+    └── plots/generate_plots.py  # renders README PNGs from results.json
+```
+
+---
+
 ## Architecture
 
 ```
@@ -97,12 +133,12 @@ per object:
 ```
 Slab (mmap'd region, e.g., 4096 bytes for 64-byte slots):
 
-┌──────────────┬───────────────────────────────────────────┐
+┌──────────────┬───────┬───────┬───────┬───────┬───────────┐
 │  Slab Header │  slot │  slot │  slot │  slot │  ...      │
 │  (freelist,  │  [0]  │  [1]  │  [2]  │  [3]  │           │
 │   count,     │       │       │       │       │           │
 │   next slab) │       │       │       │       │           │
-└──────────────┴───────────────────────────────────────────┘
+└──────────────┴───────┴───────┴───────┴───────┴───────────┘
  ▲ one kmalloc/mmap        ▲ 62 usable slots, zero per-slot overhead
 ```
 
