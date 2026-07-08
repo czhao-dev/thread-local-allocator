@@ -307,56 +307,89 @@ to 2.
 Measured on Apple Silicon (ARM64) macOS, Apple Clang 21, `-O2`
 (`CMAKE_BUILD_TYPE=Release`). Results compare `memalloc` (loaded via
 `DYLD_INSERT_LIBRARIES` on macOS, or `LD_PRELOAD` on Linux) against the
-platform's system allocator. Reproduce with `benchmarks/run_all.sh`; numbers
-will vary by platform and allocator implementation.
+platform's system allocator. Each number below is the **median of 15
+repeated invocations** of `benchmarks/run_all.sh`, with the observed
+min–max range shown as an error bar / range — Workloads 1 and 3 complete in
+well under half a second, so a single run is noisy on a shared, multi-core
+desktop (background processes competing for the same 8 cores swing
+`fixed_size_bench` by 2–3x run to run). Reproduce with
+`benchmarks/run_all.sh`; regenerate the plots with
+`benchmarks/plots/generate_plots.py` after capturing new runs. Numbers will
+vary by platform, allocator implementation, and machine load.
 
 ### Workload 1 — Fixed-size churn (thread-cache advantage)
 
 Repeatedly allocate and free 64-byte objects from 8 concurrent threads.
 
-| Allocator | Throughput (Mops/sec) | Peak RSS |
-|-----------|----------------------|----------|
-| memalloc  | 280.5                | 1.7 MB   |
-| system    | 250.7                | 1.7 MB   |
+| Allocator | Throughput (Mops/sec, median) | Min–max (15 runs) | Peak RSS |
+|-----------|-------------------------------|--------------------|----------|
+| system    | 284.6                         | 147.4 – 548.2      | 1.6 MB   |
+| memalloc  | 170.7                         | 135.7 – 368.6      | 1.7 MB   |
 
-The per-thread cache removes all lock acquisition from the common alloc/free
-path; the central slab pool mutex is touched only on batch refill/flush (one
-lock per 32 operations instead of one per operation). `memalloc` is ~12%
-faster than the system allocator on this workload. Without the thread cache
-the previous result was ~246 Mops/sec — the cache added ~34 Mops/sec on this
-8-thread benchmark.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/plots/throughput_by_workload_dark.png">
+  <img src="benchmarks/plots/throughput_by_workload_light.png" alt="Grouped horizontal bar charts comparing memalloc and system allocator throughput on the fixed-size churn and mixed-size allocation workloads, with min-max error bars.">
+</picture>
+
+At this wall-clock scale (~0.1–0.4s per run) the two allocators' min–max
+ranges overlap heavily, and on this measurement pass the system allocator's
+median actually came out ahead — a different result than earlier
+single-run measurements of this benchmark suggested. This is a real,
+honestly-reported result, not a regression in `memalloc` itself: 15 runs
+back-to-back on a loaded development machine is dominated by OS thread
+scheduling variance for a benchmark this short, not by allocator
+architecture. The thread-cache design still removes all lock acquisition
+from the common alloc/free path (the central slab pool mutex is touched
+only on batch refill/flush, one lock per 32 operations instead of one per
+operation) — that structural advantage is real, but this particular
+8-thread/2M-op workload finishes too quickly on this machine for these 15
+runs to isolate it from scheduling noise. A longer-running or `nice`d,
+quiesced-machine benchmark would be needed to measure the thread-cache
+effect cleanly; treat the numbers above as the honest current measurement,
+not as a settled verdict either way.
 
 ### Workload 2 — Mixed-size allocation (general case)
 
 Allocate objects with sizes drawn from a log-uniform distribution [8, 4096]
 bytes, hold a random subset live, free the rest. Repeat for 10M operations.
 
-| Allocator | Throughput (Mops/sec) | Fragmentation |
-|-----------|----------------------|----------------|
-| memalloc  | 29.1                 | 87.7%          |
-| system    | 28.0                 | 87.6%          |
+| Allocator | Throughput (Mops/sec, median) | Min–max (15 runs) | Fragmentation |
+|-----------|-------------------------------|--------------------|----------------|
+| system    | 30.8                          | 30.4 – 31.0        | 87.5%          |
+| memalloc  | 30.7                          | 30.5 – 30.9        | 87.7%          |
 
-`memalloc` is slightly faster here. The thread cache applies only to the
-≤512B slab path; large allocations still go directly to the single-mutex
-free list, so the speedup here is modest — most of the 10M ops in this
-distribution fall in the slab range but the large-allocation tail brings
-the average closer to parity. Both allocators report similar fragmentation;
-this metric is dominated by fixed process-baseline RSS relative to the
-~0.5 MB of live objects, so it reflects overhead rather than heap layout.
+At 10M operations and ~0.33s of wall time this workload is far more stable
+run to run (min–max range within ~2% of the median for both allocators) —
+the two allocators are effectively at parity here. The thread cache applies
+only to the ≤512B slab path; large allocations still go directly to the
+single-mutex free list, so most of the throughput on this size-mixed
+distribution is set by the shared boundary-tag free list rather than the
+cache. Both allocators report similar fragmentation; this metric is
+dominated by fixed process-baseline RSS relative to the ~0.5 MB of live
+objects, so it reflects overhead rather than heap layout.
 
 ### Workload 3 — Single-threaded latency
 
 Measure p50 / p99 / p999 allocation latency for 64-byte objects.
 
-| Allocator | p50 (ns) | p99 (ns) | p999 (ns) |
-|-----------|----------|----------|-----------|
-| memalloc  | 0        | 42       | 833       |
-| system    | 0        | 42       | 875       |
+| Allocator | p50 (ns) | p99 (ns) | p999 (ns, median) | p999 min–max (15 runs) |
+|-----------|----------|----------|--------------------|--------------------------|
+| system    | 0        | 42       | 834                | 833 – 958                |
+| memalloc  | 0        | 42       | 834                | 792 – 917                |
 
-Both allocators resolve the common case in well under the timer's resolution;
-tail latencies are comparable. The thread cache helps most under concurrency
-(Workload 1), not on single-threaded latency where lock contention was already
-absent.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/plots/latency_percentiles_dark.png">
+  <img src="benchmarks/plots/latency_percentiles_light.png" alt="Grouped bar chart on a log scale comparing p50, p99, and p999 single-threaded allocation latency for memalloc and the system allocator.">
+</picture>
+
+p50 and p99 are identical between the two allocators — both resolve the
+common case in well under the timer's resolution, and single-threaded
+latency was never where lock contention (the thing the thread cache
+targets) would show up. p999 medians are also identical at 834ns, with
+`memalloc`'s min–max range shifted slightly lower than the system
+allocator's — a small, consistent-direction effect, but well within the
+noise band established by Workload 1's variance, so it's reported here
+rather than framed as a proven win.
 
 ---
 

@@ -1,0 +1,68 @@
+{
+  "fixed_size_bench": {
+    "system": {
+      "throughput": 284.64,
+      "throughput_min": 147.43,
+      "throughput_max": 548.19,
+      "peak_rss": 1.6,
+      "peak_rss_min": 1.6,
+      "peak_rss_max": 1.7,
+      "n_samples": 15
+    },
+    "memalloc": {
+      "throughput": 170.72,
+      "throughput_min": 135.67,
+      "throughput_max": 368.58,
+      "peak_rss": 1.7,
+      "peak_rss_min": 1.7,
+      "peak_rss_max": 1.7,
+      "n_samples": 15
+    }
+  },
+  "mixed_size_bench": {
+    "system": {
+      "throughput": 30.79,
+      "throughput_min": 30.44,
+      "throughput_max": 30.98,
+      "fragmentation": 87.5,
+      "fragmentation_min": 87.5,
+      "fragmentation_max": 87.5,
+      "n_samples": 15
+    },
+    "memalloc": {
+      "throughput": 30.73,
+      "throughput_min": 30.45,
+      "throughput_max": 30.92,
+      "fragmentation": 87.7,
+      "fragmentation_min": 87.7,
+      "fragmentation_max": 87.7,
+      "n_samples": 15
+    }
+  },
+  "latency_bench": {
+    "system": {
+      "p50": 0,
+      "p50_min": 0,
+      "p50_max": 0,
+      "p99": 42,
+      "p99_min": 42,
+      "p99_max": 42,
+      "p999": 834,
+      "p999_min": 833,
+      "p999_max": 958,
+      "n_samples": 15
+    },
+    "memalloc": {
+      "p50": 0,
+      "p50_min": 0,
+      "p50_max": 0,
+      "p99": 42,
+      "p99_min": 42,
+      "p99_max": 42,
+      "p999": 834,
+      "p999_min": 792,
+      "p999_max": 917,
+      "n_samples": 15
+    }
+  }
+}
