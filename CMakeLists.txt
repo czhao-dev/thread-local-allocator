@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(memalloc LANGUAGES CXX)
+project(memalloc LANGUAGES C)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -26,19 +26,19 @@ endif()
 find_package(Threads REQUIRED)
 
 add_library(memalloc_core STATIC
-    src/mmap_utils.cpp
-    src/slab_registry.cpp
-    src/slab_pool.cpp
-    src/thread_cache.cpp
-    src/free_list.cpp
-    src/allocator.cpp
+    src/mmap_utils.c
+    src/slab_registry.c
+    src/slab_pool.c
+    src/thread_cache.c
+    src/free_list.c
+    src/allocator.c
 )
 target_include_directories(memalloc_core PUBLIC include)
 set_target_properties(memalloc_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(memalloc_core PUBLIC Threads::Threads)
 
 # Drop-in malloc/free/calloc/realloc replacement for LD_PRELOAD / DYLD_INSERT_LIBRARIES.
-add_library(memalloc SHARED src/malloc_shim.cpp)
+add_library(memalloc SHARED src/malloc_shim.c)
 target_link_libraries(memalloc PRIVATE memalloc_core)
 
 enable_testing()

@@ -1,33 +1,32 @@
-#pragma once
+#ifndef MEMALLOC_COMMON_H
+#define MEMALLOC_COMMON_H
 
-#include <cstddef>
-#include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 
-namespace memalloc {
+/* Requests at or below this size are served by the slab pools; larger
+ * requests fall through to the boundary-tag free list. */
+#define MEMALLOC_SLAB_THRESHOLD ((size_t)512)
 
-// Requests at or below this size are served by the slab pools; larger
-// requests fall through to the boundary-tag free list.
-inline constexpr std::size_t kSlabThreshold = 512;
+/* Size classes served by the slab allocator. */
+static const size_t memalloc_slab_size_classes[] = {8, 16, 32, 64, 128, 256, 512};
+#define MEMALLOC_NUM_SLAB_SIZE_CLASSES \
+    (sizeof(memalloc_slab_size_classes) / sizeof(memalloc_slab_size_classes[0]))
 
-// Size classes served by the slab allocator.
-inline constexpr std::size_t kSlabSizeClasses[] = {8, 16, 32, 64, 128, 256, 512};
-inline constexpr std::size_t kNumSlabSizeClasses =
-    sizeof(kSlabSizeClasses) / sizeof(kSlabSizeClasses[0]);
+/* Alignment guarantee provided to callers (matches max_align_t on x86-64/ARM64). */
+#define MEMALLOC_DEFAULT_ALIGN ((size_t)16)
 
-// Alignment guarantee provided to callers (matches max_align_t on x86-64/ARM64).
-inline constexpr std::size_t kDefaultAlign = 16;
-
-inline constexpr std::size_t align_up(std::size_t n, std::size_t align) {
+static inline size_t memalloc_align_up(size_t n, size_t align) {
     return (n + align - 1) & ~(align - 1);
 }
 
-// Returns the smallest slab size class that can hold `size`, or 0 if `size`
-// exceeds the largest size class (and should go to the free list instead).
-inline constexpr std::size_t slab_class_for(std::size_t size) {
-    for (std::size_t i = 0; i < kNumSlabSizeClasses; ++i) {
-        if (size <= kSlabSizeClasses[i]) return kSlabSizeClasses[i];
+/* Returns the smallest slab size class that can hold `size`, or 0 if `size`
+ * exceeds the largest size class (and should go to the free list instead). */
+static inline size_t memalloc_slab_class_for(size_t size) {
+    for (size_t i = 0; i < MEMALLOC_NUM_SLAB_SIZE_CLASSES; ++i) {
+        if (size <= memalloc_slab_size_classes[i]) return memalloc_slab_size_classes[i];
     }
     return 0;
 }
 
-}  // namespace memalloc
+#endif  /* MEMALLOC_COMMON_H */

@@ -3,6 +3,6 @@ foreach(bench_name IN ITEMS
     mixed_size_bench
     latency_bench
 )
-    add_executable(${bench_name} ${bench_name}.cpp)
-    target_link_libraries(${bench_name} PRIVATE Threads::Threads)
+    add_executable(${bench_name} ${bench_name}.c)
+    target_link_libraries(${bench_name} PRIVATE Threads::Threads m)
 endforeach()
