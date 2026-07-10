@@ -1,85 +1,44 @@
-#pragma once
+#ifndef MEMALLOC_FREE_LIST_H
+#define MEMALLOC_FREE_LIST_H
 
-#include <cstddef>
-#include <mutex>
+#include <pthread.h>
+#include <stddef.h>
 
-namespace memalloc {
+/* Opaque to callers -- full layout lives in src/free_list.c. Only pointers
+ * to these are ever stored outside that translation unit. */
+typedef struct MemallocFLHeader MemallocFLHeader;
+typedef struct MemallocFLArenaHeader MemallocFLArenaHeader;
 
-// Variable-size allocator backed by mmap'd arenas, using Knuth's boundary
-// tags for O(1) coalescing on free (see README "Variable-Size Allocator").
-//
-// Block layout (sizes are always multiples of 16):
-//
-//   [Header: size_t size|flag] [ ... payload ... ] [Footer: size_t size|flag]
-//
-// Free blocks additionally store {prev, next} pointers (a FreeNode) at the
-// start of their payload, threading an explicit doubly-linked free list used
-// for first-fit search.
-class FreeListAllocator {
-public:
-    FreeListAllocator() = default;
-    ~FreeListAllocator();
+/* Variable-size allocator backed by mmap'd arenas, using Knuth's boundary
+ * tags for O(1) coalescing on free (see README "Variable-Size Allocator").
+ *
+ * Block layout (sizes are always multiples of 16):
+ *
+ *   [Header: size_t size|flag] [ ... payload ... ] [Footer: size_t size|flag]
+ *
+ * Free blocks additionally store {prev, next} pointers (a free-node) at the
+ * start of their payload, threading an explicit doubly-linked free list used
+ * for first-fit search. */
+typedef struct {
+    pthread_mutex_t mutex;
+    MemallocFLHeader* free_list;
+    MemallocFLArenaHeader* arenas;
+} MemallocFreeList;
 
-    FreeListAllocator(const FreeListAllocator&) = delete;
-    FreeListAllocator& operator=(const FreeListAllocator&) = delete;
+void memalloc_freelist_init(MemallocFreeList* fl);
+void memalloc_freelist_destroy(MemallocFreeList* fl);
 
-    void* allocate(std::size_t size);
-    void deallocate(void* p);
-    void* reallocate(void* p, std::size_t new_size);
+void* memalloc_freelist_allocate(MemallocFreeList* fl, size_t size);
+void memalloc_freelist_deallocate(MemallocFreeList* fl, void* p);
+void* memalloc_freelist_reallocate(MemallocFreeList* fl, void* p, size_t new_size);
 
-    // Usable payload size of an allocation (>= the size it was requested with).
-    static std::size_t usable_size(void* p);
+/* Usable payload size of an allocation (>= the size it was requested with). */
+size_t memalloc_freelist_usable_size(void* p);
 
-    // Total block size (header + payload + footer). Test/debug helper.
-    static std::size_t block_total_size(void* p);
+/* Total block size (header + payload + footer). Test/debug helper. */
+size_t memalloc_freelist_block_total_size(void* p);
 
-    // Number of blocks currently on the free list. Test/debug helper.
-    std::size_t free_block_count() const;
+/* Number of blocks currently on the free list. Test/debug helper. */
+size_t memalloc_freelist_free_block_count(MemallocFreeList* fl);
 
-private:
-    struct Header {
-        std::size_t size_and_flags;
-    };
-    struct FreeNode {
-        Header* prev;
-        Header* next;
-    };
-    struct ArenaHeader {
-        ArenaHeader* next;
-        std::size_t total_size;
-    };
-
-    static constexpr std::size_t kHeaderSize = sizeof(std::size_t);
-    static constexpr std::size_t kOverhead = 2 * kHeaderSize;  // header + footer
-    static constexpr std::size_t kMinBlockSize = 32;
-    static constexpr std::size_t kArenaSize = 1u << 20;  // 1 MiB
-    // ArenaHeader + 1-word prologue "block" that precedes the first real block.
-    static constexpr std::size_t kArenaPrefix = sizeof(ArenaHeader) + kHeaderSize;
-    // 1-word epilogue "block" that follows the last real block.
-    static constexpr std::size_t kArenaSuffix = kHeaderSize;
-
-    static Header* header_of(void* payload);
-    static void* payload_of(Header* h);
-    static Header* footer_of(Header* h);
-    static std::size_t size_of(Header* h);
-    static bool is_free(Header* h);
-    static void set_tags(Header* h, std::size_t size, bool free);
-    static Header* prev_block(Header* h);
-    static Header* next_block(Header* h);
-
-    void insert_free(Header* h);
-    void remove_free(Header* h);
-    Header* find_fit(std::size_t total_size);
-    Header* extend(std::size_t min_total_size);
-    Header* coalesce(Header* h);
-    Header* split(Header* h, std::size_t alloc_total_size);
-
-    void* allocate_locked(std::size_t size);
-    void deallocate_locked(void* p);
-
-    mutable std::mutex mutex_;
-    Header* free_list_ = nullptr;
-    ArenaHeader* arenas_ = nullptr;
-};
-
-}  // namespace memalloc
+#endif  /* MEMALLOC_FREE_LIST_H */
