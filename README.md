@@ -1,6 +1,6 @@
-# memalloc — Thread-Local Memory Allocator in C++
+# memalloc — Thread-Local Memory Allocator in C
 
-[![Language](https://img.shields.io/badge/language-C%2B%2B17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![Language](https://img.shields.io/badge/language-C11-blue.svg)](https://en.cppreference.com/w/c/11)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A from-scratch memory allocator implementing three complementary strategies: a
@@ -47,32 +47,32 @@ native applications.
 
 ```text
 .
-├── CMakeLists.txt               # top-level: C++17, options, MEMALLOC_ENABLE_ASAN
+├── CMakeLists.txt               # top-level: C11, options, MEMALLOC_ENABLE_ASAN
 ├── include/memalloc/            # public headers (the allocator API)
-│   ├── allocator.h              # top-level Allocator facade
+│   ├── allocator.h              # top-level facade (memalloc_allocate/...)
 │   ├── common.h                 # shared constants/helpers
 │   ├── thread_cache.h           # per-thread cache (lock-free fast path)
 │   ├── slab_pool.h              # central slab back-end (one mutex/class)
 │   └── free_list.h              # boundary-tag free list (>512B allocations)
 ├── src/                         # implementation
-│   ├── allocator.cpp            # facade dispatch
-│   ├── thread_cache.cpp         # ThreadCache impl
-│   ├── slab_pool.cpp            # SlabPool impl
-│   ├── slab_registry.h / .cpp   # pointer -> owning slab lookup
-│   ├── free_list.cpp            # boundary tags + coalescing
-│   ├── mmap_utils.h / .cpp      # mmap/munmap wrappers
-│   └── malloc_shim.cpp          # LD_PRELOAD / DYLD_INSERT_LIBRARIES entry points
+│   ├── allocator.c              # facade dispatch
+│   ├── thread_cache.c           # ThreadCache impl
+│   ├── slab_pool.c              # SlabPool impl
+│   ├── slab_registry.h / .c     # pointer -> owning slab lookup
+│   ├── free_list.c              # boundary tags + coalescing
+│   ├── mmap_utils.h / .c        # mmap/munmap wrappers
+│   └── malloc_shim.c            # LD_PRELOAD / DYLD_INSERT_LIBRARIES entry points
 ├── tests/                       # CTest binaries, one per file
-│   ├── test_alignment.cpp
-│   ├── test_values.cpp
-│   ├── test_coalesce.cpp
-│   ├── test_double_free.cpp     # forked-child SIGABRT check
-│   ├── test_concurrent.cpp      # 8 threads x 20,000 ops stress test
-│   └── test_thread_cache.cpp    # cross-thread free + thread-exit drain
+│   ├── test_alignment.c
+│   ├── test_values.c
+│   ├── test_coalesce.c
+│   ├── test_double_free.c       # forked-child SIGABRT check
+│   ├── test_concurrent.c        # 8 threads x 20,000 ops stress test
+│   └── test_thread_cache.c      # cross-thread free + thread-exit drain
 └── benchmarks/                  # throughput/latency vs. system allocator
-    ├── fixed_size_bench.cpp
-    ├── mixed_size_bench.cpp
-    ├── latency_bench.cpp
+    ├── fixed_size_bench.c
+    ├── mixed_size_bench.c
+    ├── latency_bench.c
     ├── run_all.sh               # drives all three + the system allocator
     └── plots/generate_plots.py  # renders README PNGs from results.json
 ```
@@ -149,17 +149,17 @@ free slot stores a pointer to the next free slot. Allocation is a pointer
 pop — O(1), branchless, cache-local. Deallocation is a pointer push — equally
 O(1).
 
-```cpp
-void* SlabPool::allocate() {
-    if (!free_slot_) grow();          // current slab exhausted — map new one
-    void* p = free_slot_;
-    free_slot_ = *static_cast<void**>(free_slot_);  // pop from free list
+```c
+void* memalloc_slabpool_allocate(MemallocSlabPool* pool) {
+    if (!pool->free_slot) memalloc_slabpool_grow(pool);  // current slab exhausted — map new one
+    void* p = pool->free_slot;
+    pool->free_slot = *(void**)pool->free_slot;  // pop from free list
     return p;
 }
 
-void SlabPool::deallocate(void* p) {
-    *static_cast<void**>(p) = free_slot_;  // push onto free list
-    free_slot_ = p;
+void memalloc_slabpool_deallocate(MemallocSlabPool* pool, void* p) {
+    *(void**)p = pool->free_slot;  // push onto free list
+    pool->free_slot = p;
 }
 ```
 
@@ -230,15 +230,16 @@ complexity — this is the approach taken by jemalloc.
 ### Per-thread cache (slab fast path)
 
 For small allocations (≤512B) the calling thread never acquires a lock on the
-common path. Each thread holds a `ThreadCache` (constructed lazily on first
-access via a `thread_local`) with an embedded free list per size class:
+common path. Each thread holds a `MemallocThreadCache` (constructed lazily on
+first access via `memalloc_thread_cache_for`) with an embedded free list per
+size class:
 
-```cpp
-void* ThreadCache::allocate(size_t idx) {
-    Bucket& b = buckets_[idx];
-    if (b.count == 0) refill_from_central_pool(idx);  // one lock, 32 objects
-    void* p = b.head;
-    b.head = *static_cast<void**>(p);  // pop — no lock
+```c
+void* memalloc_threadcache_allocate(MemallocThreadCache* tc, size_t idx) {
+    MemallocTCBucket* b = &tc->buckets[idx];
+    if (b->count == 0) refill_from_central_pool(tc, idx);  // one lock, 32 objects
+    void* p = b->head;
+    b->head = *(void**)p;  // pop — no lock
     return p;
 }
 ```
@@ -253,21 +254,30 @@ the central `SlabPool` level `header_for(p)` identifies the owning slab by
 masking the pointer, so flushing back works regardless of which thread
 originally allocated the object.
 
-**Thread-exit cleanup**: the `ThreadCache` destructor flushes all buckets back
-to the central pools. If `malloc` is called again on the same thread after that
-destructor has run (possible when another library's TLS destructor calls malloc
-during teardown), a `dead_` guard flag redirects the call directly to the
-central `SlabPool`, which is safe to call from any execution context. Residual
-risk: a `quick_exit` or `abort` skips C++ destructors entirely, leaving cached
-objects unreachable — this matches the behaviour of tcmalloc and jemalloc,
-which also accept this edge case in exchange for avoiding per-CPU cache
-complexity.
+**Thread-exit cleanup**: since C has no destructors, thread-exit cleanup is
+implemented with a `pthread_key_t` whose destructor callback flushes all
+buckets back to the central pools. The `MemallocThreadCache` itself is
+deliberately backed by an explicit `mmap`'d allocation rather than a plain
+`_Thread_local` object — on platforms where PIC code forces the "dynamic" TLS
+model (e.g. Apple's dyld TLV implementation), a `_Thread_local` object is
+heap-backed and freed by the runtime's own per-thread cleanup, which can run
+before or interleaved with a `pthread_key_t` destructor, making its address
+unsafe to hand to that destructor. A `_Thread_local` *pointer* to the mmap'd
+block is still used as a fast per-thread cache of "where is my cache", since a
+bare pointer has no cleanup ordering hazard of its own. If `malloc` is called
+again on the same thread after the destructor has run (possible when another
+library's TLS destructor calls malloc during teardown), a `dead` guard flag
+redirects the call directly to the central `SlabPool`, which is safe to call
+from any execution context. Residual risk: a `quick_exit` skips
+`pthread_key_t` destructors entirely, leaving cached objects unreachable —
+this matches the behaviour of tcmalloc and jemalloc, which also accept this
+edge case in exchange for avoiding per-CPU cache complexity.
 
 ### Central slab back-end
 
-Each `SlabPool` (one per size class) has its own `std::mutex`. Threads only
-contend on a class's mutex when their cache refills or flushes, not on every
-operation. Concurrent allocations of different size classes are always
+Each `SlabPool` (one per size class) has its own `pthread_mutex_t`. Threads
+only contend on a class's mutex when their cache refills or flushes, not on
+every operation. Concurrent allocations of different size classes are always
 contention-free.
 
 ### Large allocations
@@ -465,7 +475,7 @@ slightly higher per-free overhead.
 
 ### Requirements
 
-- C++17 compiler (GCC 9+, Clang 10+, Apple Clang)
+- C11 compiler (GCC 9+, Clang 10+, Apple Clang)
 - Linux or macOS (uses `mmap`)
 - `cmake` 3.16+
 
