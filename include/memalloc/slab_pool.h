@@ -1,79 +1,67 @@
-#pragma once
+#ifndef MEMALLOC_SLAB_POOL_H
+#define MEMALLOC_SLAB_POOL_H
 
-#include <cstddef>
-#include <cstdint>
-#include <mutex>
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
 
-namespace memalloc {
+typedef struct MemallocSlabRegistry MemallocSlabRegistry;
 
-class SlabRegistry;
+/* Slabs are mapped at an address aligned to their own size, so that the
+ * owning slab of any slot pointer can be found by masking off the low
+ * log2(kSlabSize) bits. Must be a power of two. */
+#define MEMALLOC_SLAB_SIZE ((size_t)1u << 16)  /* 64 KiB */
 
-// A pool of fixed-size slots carved out of mmap'd "slabs". Each slab embeds
-// its own free list directly in the unused slots (see README "Slab
-// Allocator Design"), so allocation/deallocation are O(1) pointer
-// pop/push operations once the pool's mutex is held.
-class SlabPool {
-public:
-    // Slabs are mapped at an address aligned to their own size, so that the
-    // owning slab of any slot pointer can be found by masking off the low
-    // log2(kSlabSize) bits. Must be a power of two.
-    static constexpr std::size_t kSlabSize = 1u << 16;  // 64 KiB
+/* Header stored at the start of every slab (i.e. at the slab's aligned
+ * base address). Exposed so the allocator facade can identify which
+ * pool owns a slot purely from its address. */
+typedef struct MemallocSlabHeader {
+    struct MemallocSlabHeader* next_partial;  /* next slab in this pool with a free slot */
+    struct MemallocSlabHeader* next_all;      /* next slab in this pool, for teardown */
+    void* free_list;                          /* embedded free list of free slots */
+    uint32_t free_count;
+    uint32_t slot_size;
+} MemallocSlabHeader;
 
-    // Header stored at the start of every slab (i.e. at the slab's aligned
-    // base address). Exposed so the allocator facade can identify which
-    // pool owns a slot purely from its address.
-    struct SlabHeader {
-        SlabHeader* next_partial;  // next slab in this pool with a free slot
-        SlabHeader* next_all;      // next slab in this pool, for teardown
-        void* free_list;           // embedded free list of free slots
-        std::uint32_t free_count;
-        std::uint32_t slot_size;
-    };
+/* A pool of fixed-size slots carved out of mmap'd "slabs". Each slab embeds
+ * its own free list directly in the unused slots (see README "Slab
+ * Allocator Design"), so allocation/deallocation are O(1) pointer
+ * pop/push operations once the pool's mutex is held. */
+typedef struct MemallocSlabPool {
+    pthread_mutex_t mutex;
+    MemallocSlabRegistry* registry;
+    MemallocSlabHeader* partial;  /* slabs with at least one free slot */
+    MemallocSlabHeader* all;      /* every slab ever mapped, for teardown */
+    size_t slot_size;
+    size_t slots_per_slab;
+    size_t first_slot_offset;
+} MemallocSlabPool;
 
-    // `registry` is notified of every slab base address mapped by this pool
-    // so the allocator facade can route deallocate(p) correctly.
-    SlabPool(std::size_t slot_size, SlabRegistry& registry);
-    ~SlabPool();
+/* `registry` is notified of every slab base address mapped by this pool
+ * so the allocator facade can route deallocate(p) correctly. */
+void memalloc_slabpool_init(MemallocSlabPool* pool, size_t slot_size, MemallocSlabRegistry* registry);
+void memalloc_slabpool_destroy(MemallocSlabPool* pool);
 
-    SlabPool(const SlabPool&) = delete;
-    SlabPool& operator=(const SlabPool&) = delete;
+void* memalloc_slabpool_allocate(MemallocSlabPool* pool);
+void memalloc_slabpool_deallocate(MemallocSlabPool* pool, void* p);
 
-    void* allocate();
-    void deallocate(void* p);
+/* Batch variants used by ThreadCache to amortize lock acquisition.
+ * allocate_batch pops up to `n` slots under a single lock, threads them
+ * via their embedded next-pointer field, and returns the list head (or
+ * NULL if OOM even after growing). *out_count is set to the actual
+ * number obtained. */
+void* memalloc_slabpool_allocate_batch(MemallocSlabPool* pool, uint32_t n, uint32_t* out_count);
 
-    // Batch variants used by ThreadCache to amortize lock acquisition.
-    // allocate_batch pops up to `n` slots under a single lock, threads them
-    // via their embedded next-pointer field, and returns the list head (or
-    // nullptr if OOM even after grow()). *out_count is set to the actual
-    // number obtained.
-    void* allocate_batch(std::uint32_t n, std::uint32_t* out_count);
+/* deallocate_batch pushes all `count` slots in `list_head` (linked via
+ * embedded next-pointer field) back to their owning slabs under one lock. */
+void memalloc_slabpool_deallocate_batch(MemallocSlabPool* pool, void* list_head, uint32_t count);
 
-    // deallocate_batch pushes all `count` slots in `list_head` (linked via
-    // embedded next-pointer field) back to their owning slabs under one lock.
-    void deallocate_batch(void* list_head, std::uint32_t count);
+/* Returns the number of slabs currently mapped by this pool. Test helper. */
+size_t memalloc_slabpool_mapped_slab_count(MemallocSlabPool* pool);
 
-    std::size_t slot_size() const { return slot_size_; }
+static inline MemallocSlabHeader* memalloc_slabpool_header_for(void* p) {
+    uintptr_t addr = (uintptr_t)p;
+    return (MemallocSlabHeader*)(addr & ~(MEMALLOC_SLAB_SIZE - 1));
+}
 
-    // Returns the number of slabs currently mapped by this pool. Test helper.
-    std::size_t mapped_slab_count() const;
-
-    static SlabHeader* header_for(void* p) {
-        auto addr = reinterpret_cast<std::uintptr_t>(p);
-        return reinterpret_cast<SlabHeader*>(addr & ~(kSlabSize - 1));
-    }
-
-private:
-    // Maps a new slab and adds it to the pool. Returns false if the mmap
-    // failed (out of memory).
-    bool grow();
-
-    mutable std::mutex mutex_;
-    SlabRegistry& registry_;
-    SlabHeader* partial_ = nullptr;  // slabs with at least one free slot
-    SlabHeader* all_ = nullptr;      // every slab ever mapped, for teardown
-    std::size_t slot_size_;
-    std::size_t slots_per_slab_;
-    std::size_t first_slot_offset_;
-};
-
-}  // namespace memalloc
+#endif  /* MEMALLOC_SLAB_POOL_H */
